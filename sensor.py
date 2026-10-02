@@ -40,6 +40,7 @@ from homeassistant.helpers.update_coordinator import (
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_UPDATE_INTERVAL = 30
 FETCH_TIMEOUT = 30
+DOMAIN = "franklin_wh"
 
 PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
@@ -108,103 +109,108 @@ async def async_setup_platform(
     else:
         prefix = "FranklinWH"
 
-    fetcher = franklinwh.TokenFetcher(username, password)
-    if supports_http2():
-        # pylint: disable=no-name-in-module,import-outside-toplevel
-        from homeassistant.helpers.httpx_client import (  # noqa: PLC0415
-            SSL_ALPN_HTTP11_HTTP2,  # type: ignore  # noqa: PGH003
-            create_async_httpx_client,
-        )
-        # pylint: enable=no-name-in-module,import-outside-toplevel
-
-        def get_client() -> httpx.AsyncClient:
-            return create_async_httpx_client(hass, alpn_protocols=SSL_ALPN_HTTP11_HTTP2)
-
-        franklinwh.HttpClientFactory.set_client_factory(get_client)
-        client = franklinwh.Client(fetcher, gateway)
+    hass.data.setdefault(DOMAIN, {})
+    if gateway in hass.data[DOMAIN]:
+        coordinator = hass.data[DOMAIN][gateway]
     else:
-        client = await hass.async_add_executor_job(franklinwh.Client, fetcher, gateway)
+        fetcher = franklinwh.TokenFetcher(username, password)
+        if supports_http2():
+            # pylint: disable=no-name-in-module,import-outside-toplevel
+            from homeassistant.helpers.httpx_client import (  # noqa: PLC0415
+                SSL_ALPN_HTTP11_HTTP2,  # type: ignore  # noqa: PGH003
+                create_async_httpx_client,
+            )
+            # pylint: enable=no-name-in-module,import-outside-toplevel
 
-    cache = StaleDataCache()
+            def get_client() -> httpx.AsyncClient:
+                return create_async_httpx_client(hass, alpn_protocols=SSL_ALPN_HTTP11_HTTP2)
 
-    async def _update_data() -> franklinwh.Stats:
-        max_retries = 3
-        retry_delay = 2  # seconds
+            franklinwh.HttpClientFactory.set_client_factory(get_client)
+            client = franklinwh.Client(fetcher, gateway)
+        else:
+            client = await hass.async_add_executor_job(franklinwh.Client, fetcher, gateway)
 
-        _LOGGER.debug("Fetching latest data from FranklinWH")
-        for attempt in range(max_retries):
-            if attempt > 0:
-                _LOGGER.warning("Trying again")
-                await asyncio.sleep(retry_delay)
-            try:
-                # Bound the fetch: without a timeout, a single hung request
-                # stops the DataUpdateCoordinator forever (the next poll is
-                # only scheduled once this one finishes) with nothing logged.
-                async with asyncio.timeout(FETCH_TIMEOUT):
-                    data = await client.get_stats()
-            except TimeoutError as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - request hung for %ss: %s",
-                    FETCH_TIMEOUT,
-                    e,
-                )
-            except franklinwh.client.DeviceTimeoutException as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - Device Timeout: %s", e
-                )
-            except franklinwh.client.GatewayOfflineException as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - Gateway Offline %s", e
-                )
-            except franklinwh.client.AccountLockedException as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - Account Locked %s", e
-                )
-            except franklinwh.client.InvalidCredentialsException as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - Invalid Credentials %s", e
-                )
-            except franklinwh.client.InvalidDataException as e:
-                _LOGGER.warning(
-                    "Error getting data from FranklinWH - Invalid Body Returned %s", e
-                )
-            except httpx.ReadTimeout as e:
-                _LOGGER.warning(
-                    "Timeout fetching data from FranklinWH: %s", e
-                )
-            else:
+        cache = StaleDataCache()
+
+        async def _update_data() -> franklinwh.Stats:
+            max_retries = 3
+            retry_delay = 2  # seconds
+
+            _LOGGER.debug("Fetching latest data from FranklinWH")
+            for attempt in range(max_retries):
                 if attempt > 0:
+                    _LOGGER.warning("Trying again")
+                    await asyncio.sleep(retry_delay)
+                try:
+                    # Bound the fetch: without a timeout, a single hung request
+                    # stops the DataUpdateCoordinator forever (the next poll is
+                    # only scheduled once this one finishes) with nothing logged.
+                    async with asyncio.timeout(FETCH_TIMEOUT):
+                        data = await client.get_stats()
+                except TimeoutError as e:
                     _LOGGER.warning(
-                        "Successfully fetched data from FranklinWH after retry"
+                        "Error getting data from FranklinWH - request hung for %ss: %s",
+                        FETCH_TIMEOUT,
+                        e,
+                    )
+                except franklinwh.client.DeviceTimeoutException as e:
+                    _LOGGER.warning(
+                        "Error getting data from FranklinWH - Device Timeout: %s", e
+                    )
+                except franklinwh.client.GatewayOfflineException as e:
+                    _LOGGER.warning(
+                        "Error getting data from FranklinWH - Gateway Offline %s", e
+                    )
+                except franklinwh.client.AccountLockedException as e:
+                    _LOGGER.warning(
+                        "Error getting data from FranklinWH - Account Locked %s", e
+                    )
+                except franklinwh.client.InvalidCredentialsException as e:
+                    _LOGGER.warning(
+                        "Error getting data from FranklinWH - Invalid Credentials %s", e
+                    )
+                except franklinwh.client.InvalidDataException as e:
+                    _LOGGER.warning(
+                        "Error getting data from FranklinWH - Invalid Body Returned %s", e
+                    )
+                except httpx.ReadTimeout as e:
+                    _LOGGER.warning(
+                        "Timeout fetching data from FranklinWH: %s", e
                     )
                 else:
-                    _LOGGER.debug("Fetched latest data from FranklinWH: %s", data)
-                cache.store(data)
-                return data
+                    if attempt > 0:
+                        _LOGGER.warning(
+                            "Successfully fetched data from FranklinWH after retry"
+                        )
+                    else:
+                        _LOGGER.debug("Fetched latest data from FranklinWH: %s", data)
+                    cache.store(data)
+                    return data
 
-        _LOGGER.warning(
-            "Failed to fetch data from FranklinWH after %s attempts", max_retries
+            _LOGGER.warning(
+                "Failed to fetch data from FranklinWH after %s attempts", max_retries
+            )
+
+            if config["tolerate_stale_data"] and cache.is_populated():
+                return cache.data()
+
+            raise UpdateFailed(
+                f"Failed to fetch data from FranklinWH after {max_retries} attempts."
+            )
+
+        coordinator = DataUpdateCoordinator[franklinwh.Stats](
+            hass,
+            _LOGGER,
+            name="franklinwh",
+            update_method=_update_data,
+            update_interval=update_interval,
+            always_update=False,
         )
+        hass.data[DOMAIN][gateway] = coordinator
 
-        if config["tolerate_stale_data"] and cache.is_populated():
-            return cache.data()
-
-        raise UpdateFailed(
-            f"Failed to fetch data from FranklinWH after {max_retries} attempts."
-        )
-
-    coordinator = DataUpdateCoordinator[franklinwh.Stats](
-        hass,
-        _LOGGER,
-        name="franklinwh",
-        update_method=_update_data,
-        update_interval=update_interval,
-        always_update=False,
-    )
-
-    # Initial fetch (If we don't kick this off manually, we'll get unavailable
-    # sensors until the first scheduled update).
-    await coordinator.async_refresh()
+        # Initial fetch (If we don't kick this off manually, we'll get unavailable
+        # sensors until the first scheduled update).
+        await coordinator.async_refresh()
 
     async_add_entities(
         [
@@ -607,3 +613,4 @@ class V2LImportSensor(FranklinSensor):
     def native_value(self):
         """Value."""
         return self.coordinator.data.totals.v2l_import
+

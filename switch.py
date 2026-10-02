@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 
+from __future__ import annotations
+
+from datetime import timedelta
+import logging
+
 import franklinwh
 
 from homeassistant.components.switch import (
@@ -22,9 +27,9 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
+    UpdateFailed,
 )
 
-import logging
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_UPDATE_INTERVAL = 30
 
@@ -33,8 +38,9 @@ PLATFORM_SCHEMA = PARENT_PLATFORM_SCHEMA.extend(
             vol.Required(CONF_USERNAME): cv.string,
             vol.Required(CONF_PASSWORD): cv.string,
             vol.Required(CONF_ID): cv.string,
-            vol.Required(CONF_NAME): cv.string,
-            vol.Required(CONF_SWITCHES): cv.ensure_list(vol.In([1, 2, 3])),
+            vol.Optional(CONF_NAME): cv.string,
+            vol.Optional(CONF_SWITCHES): cv.ensure_list(vol.In([1, 2, 3])),
+            vol.Optional("storm_hedge", default=False): cv.boolean,
             vol.Optional("use_sn", default=False): cv.boolean,
             vol.Optional("prefix", default=False): cv.string,
             vol.Optional("update_interval", default=DEFAULT_UPDATE_INTERVAL): cv.time_period,
@@ -47,26 +53,31 @@ async def async_setup_platform(
     add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None
 ) -> None:
-    """Set up the sensor platform."""
+    """Set up the switch platform."""
     username: str = config[CONF_USERNAME]
     password: str = config[CONF_PASSWORD]
     gateway: str = config[CONF_ID]
-    name: str = config[CONF_NAME]
     update_interval: timedelta = config["update_interval"]
 
-    # TODO(richo) why does it string the default value
     if config["use_sn"] and config["use_sn"] != "False":
         unique_id = gateway
     else:
         unique_id = None
 
-    # TODO(richo) why does it string the default value
     if config["prefix"] and config["prefix"] != "False":
         prefix = config["prefix"]
     else:
         prefix = "FranklinWH"
 
+    # Storm Hedge switch (no smart circuit required)
+    if config.get("storm_hedge"):
+        await _setup_storm_hedge_switch(hass, config, add_entities)
 
+    # Smart circuit switches
+    if not config.get(CONF_SWITCHES):
+        return
+
+    name: str = config[CONF_NAME]
     switches: list[int] = list(map(lambda x: x-1, config[CONF_SWITCHES]))
 
     fetcher = franklinwh.TokenFetcher(username, password)
@@ -86,7 +97,6 @@ async def async_setup_platform(
         except franklinwh.client.InvalidCredentialsException as e:
             _LOGGER.warning("Error getting data from FranklinWH - Invalid Credentials %s", e)
 
-    # TODO(richo) This should be memoized and shared among instances
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -95,14 +105,58 @@ async def async_setup_platform(
         update_interval=update_interval,
         always_update=False
     )
-
-    # Initial fetch (If we don't kick this off manually, we'll get unavailable
-    # sensors until the first scheduled update).
     await coordinator.async_refresh()
 
     add_entities([
         SmartCircuitSwitch(prefix, unique_id, name, switches, client, coordinator),
         ])
+
+
+async def _setup_storm_hedge_switch(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up the Storm Hedge switch (called from async_setup_platform)."""
+    username: str = config[CONF_USERNAME]
+    password: str = config[CONF_PASSWORD]
+    gateway: str = config[CONF_ID]
+
+    if config.get("prefix") and config["prefix"] != "False":
+        prefix = config["prefix"]
+    else:
+        prefix = "FranklinWH"
+
+    _storm_fetcher = franklinwh.TokenFetcher(username, password)
+    _storm_client = franklinwh.Client(_storm_fetcher, gateway)
+
+    async def _storm_update_data() -> dict:
+        try:
+            result = (
+                await _storm_client._get(  # noqa: SLF001
+                    _storm_client.url_base
+                    + "hes-gateway/terminal/weather/getStormSetting",
+                    {"equipNo": gateway},
+                )
+            )["result"]
+            return {"enabled": result.get("enableStorm", 0) == 1}
+        except franklinwh.client.DeviceTimeoutException as e:
+            raise UpdateFailed(f"Device timeout: {e}") from e
+        except franklinwh.client.GatewayOfflineException as e:
+            raise UpdateFailed(f"Gateway offline: {e}") from e
+        except Exception as e:  # noqa: BLE001
+            raise UpdateFailed(f"Error reading Storm Hedge state: {e}") from e
+
+    storm_coordinator: DataUpdateCoordinator[dict] = DataUpdateCoordinator(
+        hass,
+        _LOGGER,
+        name="franklinwh_storm_switch",
+        update_method=_storm_update_data,
+        update_interval=timedelta(minutes=5),
+        always_update=False,
+    )
+    await storm_coordinator.async_refresh()
+    async_add_entities([StormHedgeSwitch(storm_coordinator, prefix, gateway, _storm_client)])
 
 # Is it chill to have a switch in here? We'll see!
 class SmartCircuitSwitch(CoordinatorEntity, SwitchEntity):
@@ -159,3 +213,66 @@ class SmartCircuitSwitch(CoordinatorEntity, SwitchEntity):
             switches[i] = False
         await self.client.set_smart_switch_state(switches)
         await self.coordinator.async_refresh()
+
+
+class StormHedgeSwitch(
+    CoordinatorEntity[DataUpdateCoordinator[dict]], SwitchEntity
+):
+    """Switch to enable or disable Storm Hedge on the FranklinWH aGate."""
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator[dict],
+        prefix: str,
+        gateway: str,
+        client: franklinwh.Client,
+    ) -> None:
+        """Initialise."""
+        super().__init__(coordinator)
+        self._client = client
+        self._gateway = gateway
+        self._attr_name = f"{prefix} Storm Hedge"
+        self._attr_unique_id = f"{gateway}_storm_hedge_switch"
+
+    @property
+    def available(self) -> bool:
+        """Entity is available when the coordinator has data."""
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.data is not None
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when Storm Hedge is enabled."""
+        if self.coordinator.data is None:
+            return None
+        return self.coordinator.data.get("enabled", False)
+
+    async def _set_storm_hedge(self, enable: bool) -> None:
+        """Call switchStorm on the gateway.
+
+        Confirmed body format via MITM capture 2026-06-05:
+        {"equipNo": "...", "stormEn": 0|1}
+        """
+        import json as _json  # noqa: PLC0415
+        url = self._client.url_base + "hes-gateway/terminal/weather/switchStorm"
+        body = {"equipNo": self._gateway, "stormEn": 1 if enable else 0}
+        result = await self._client.session.post(
+            url,
+            params={"gatewayId": self._gateway, "lang": "en_US"},
+            headers={"loginToken": self._client.token, "Content-Type": "application/json"},
+            data=_json.dumps(body),
+        )
+        data = result.json()
+        if data.get("code") != 200:
+            _LOGGER.warning("switchStorm failed: %s", data)
+        await self.coordinator.async_refresh()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Enable Storm Hedge."""
+        await self._set_storm_hedge(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Disable Storm Hedge."""
+        await self._set_storm_hedge(False)
